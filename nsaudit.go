@@ -17,8 +17,7 @@ import (
 )
 
 var (
-	nsCache       = make(map[string]string)
-	channelBuffer = 4096
+	nsCache = make(map[string]string)
 )
 
 type DomainNS struct {
@@ -30,6 +29,10 @@ type DomainNS struct {
 
 var argsFile = goopt.String([]string{"-f", "--file"}, "domains.csv", "Read domains from this file")
 var argsNS = goopt.Strings([]string{"-n", "--nameserver"}, "", "Name server to check for (use option multiple times)")
+var argsCB = goopt.Int([]string{"-c", "--channel-buffer"}, 4096, "Size of the golang channel buffer, must be larger than number of domains")
+var argsW = goopt.Int([]string{"-w", "--workers"}, 10, "Concurrent workers to start to fetch DNS records")
+var argsTO = goopt.Int([]string{"-t", "--timeout"}, 5, "DNS timeout in seconds")
+var argsRE = goopt.Int([]string{"-r", "--retry"}, 3, "DNS retry times before giving up")
 
 func main() {
 
@@ -54,8 +57,8 @@ func main() {
 	defer domains.Close()
 
 	// Create our buffered channel
-	inChan := make(chan string, channelBuffer)
-	outChan := make(chan DomainNS, channelBuffer)
+	inChan := make(chan string, *argsCB)
+	outChan := make(chan DomainNS, *argsCB)
 
 	// Insert domains into buffered channel, we do this as a go func in case
 	// we're inserting more records than the channel has buffers. Once a buffer
@@ -72,7 +75,7 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < *argsW; i++ {
 		log.Println("Starting worker:", i)
 
 		wg.Add(1)
@@ -107,7 +110,7 @@ func main() {
 	totalErrors := 0
 	domainsWithErrors := 0
 
-	log.Println("Results:")
+	fmt.Println()
 	done := false
 	for {
 		select {
@@ -134,8 +137,8 @@ func main() {
 
 	fmt.Printf("\nStats\n-----\n")
 	fmt.Printf("Domains: %d\n", totalDomains)
-	fmt.Printf("Domains with Errors/Warnings: %d (%d%%)\n", domainsWithErrors, domainsWithErrors/totalDomains*100)
-	fmt.Printf("Domains without Errors/Warnings: %d (%d%%)\n", totalDomains-domainsWithErrors, (totalDomains-domainsWithErrors)/totalDomains*100)
+	fmt.Printf("Domains with Errors/Warnings: %d (%.0f%%)\n", domainsWithErrors, float64(domainsWithErrors)/float64(totalDomains)*100)
+	fmt.Printf("Domains without Errors/Warnings: %d (%.0f%%)\n", totalDomains-domainsWithErrors, float64(totalDomains-domainsWithErrors)/float64(totalDomains)*100)
 	fmt.Printf("Total Errors: %d\n", totalErrors)
 
 }
@@ -159,7 +162,7 @@ func compareNS(requiredNS mapset.Set, domainNS DomainNS) (errors int) {
 
 	registrarVrequired := domainNS.RegistrarNS.Difference(requiredNS)
 	if registrarVrequired.Cardinality() > 0 {
-		fmt.Printf("ERROR: In registrar, not required: %v\n", registrarVrequired)
+		fmt.Println("ERROR: In registrar, not required:", registrarVrequired)
 		errors++
 	}
 
@@ -173,6 +176,10 @@ func compareNS(requiredNS mapset.Set, domainNS DomainNS) (errors int) {
 	if registrarVzone.Cardinality() > 0 {
 		fmt.Println("WARN: In registrar, not in zone:", registrarVzone)
 		errors++
+	}
+
+	if errors == 0 {
+		fmt.Println("OK")
 	}
 
 	return
@@ -195,13 +202,13 @@ func checkDomain(domain string) (domainNS DomainNS, err error) {
 	}
 	log.Printf("Domain: %s, Parent: %s, ParentNS: %s", domain, parent, parentNS)
 
-	log.Println("Fetching registrar NS records...")
+	log.Println("Fetching registrar NS records for domain:", domain)
 	domainNS.RegistrarNS, err = queryNS(domain, parentNS, true)
 	if err != nil {
 		return
 	}
 
-	log.Println("Fetching zone NS records...")
+	log.Println("Fetching zone NS records for domain:", domain)
 	domainNS.ZoneNS, err = queryNS(domain, zoneNS, false)
 	if err != nil {
 		return
@@ -246,15 +253,15 @@ func query(domain, parentNS string) (r *dns.Msg, err error) {
 	m := new(dns.Msg)
 	m.SetQuestion(domain, dns.TypeNS)
 
-	for i := 1; i <= 3; i++ {
-		c := dns.Client{DialTimeout: time.Duration(i*5) * time.Second}
+	for i := 1; i <= *argsRE; i++ {
+		c := dns.Client{DialTimeout: time.Duration(*argsTO) * time.Second}
 		r, _, err = c.Exchange(m, parentNS+":53")
 		if err == nil {
 			return
 		}
 	}
 
-	return nil, errors.New("Too many retries, given up")
+	return nil, errors.New(fmt.Sprintf("Too many retries looking up NS records for domain %s to server %s, last error: %s", domain, parentNS, err))
 
 }
 
