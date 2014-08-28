@@ -47,11 +47,13 @@ func main() {
 			continue
 		}
 
+		compareNS(domain, requiredNS, registrarNS, zoneNS)
+
 	}
 
 }
 
-func processResults(domain string, requiredNS, registrarNS, zoneNS mapset.Set) {
+func compareNS(domain string, requiredNS, registrarNS, zoneNS mapset.Set) {
 
 	//log.Print(registrarNS)
 	//log.Print(zoneNS)
@@ -65,9 +67,21 @@ func processResults(domain string, requiredNS, registrarNS, zoneNS mapset.Set) {
 	}
 
 	registrarVzone := registrarNS.Difference(zoneNS)
-	if zoneVregistrar.Cardinality() > 0 {
+	if registrarVzone.Cardinality() > 0 {
 		log.Println("WARNING, the following entries are in the registrar, but not in the zone")
-		log.Println(zoneVregistrar)
+		log.Println(registrarVzone)
+	}
+
+	requiredVregistrar := requiredNS.Difference(registrarNS)
+	if requiredVregistrar.Cardinality() > 0 {
+		log.Println("WARNING the following entries are required, but not in the registrar")
+		log.Println(requiredVregistrar)
+	}
+
+	registrarVrequired := registrarNS.Difference(requiredNS)
+	if registrarVrequired.Cardinality() > 0 {
+		log.Println("WARNING, the following entries are in the registrar, but not required")
+		log.Println(registrarVrequired)
 	}
 
 }
