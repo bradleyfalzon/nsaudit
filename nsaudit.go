@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/deckarep/golang-set"
+	"github.com/droundy/goopt"
 	"github.com/miekg/dns"
 )
 
@@ -23,26 +23,31 @@ var (
 
 type DomainNS struct {
 	Domain string
+	Error  error
 	RegistrarNS,
 	ZoneNS mapset.Set
 }
 
+var argsFile = goopt.String([]string{"-f", "--file"}, "domains.csv", "Read domains from this file")
+var argsNS = goopt.Strings([]string{"-n", "--nameserver"}, "", "Name server to check for (use option multiple times)")
+
 func main() {
 
-	flag.Parse()
-
-	if len(flag.Args()) == 0 {
-		log.Fatalln("List all name servers as arguments.")
-	}
-
-	log.Printf("Loaded, checking for name servers: %v\n", flag.Args())
+	goopt.Parse(nil)
 
 	requiredNS := mapset.NewSet()
-	for _, ns := range flag.Args() {
+	for _, ns := range *argsNS {
+		ns := strings.TrimRight(ns, ".") + "."
 		requiredNS.Add(ns)
 	}
 
-	domains, err := os.Open("domains.txt")
+	if requiredNS.Cardinality() == 0 {
+		log.Fatalln("Name servers not set, see --help")
+	}
+
+	log.Printf("Loaded, checking for name servers: %v\n", requiredNS)
+
+	domains, err := os.Open(*argsFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -81,7 +86,6 @@ func main() {
 					domainNS, err := checkDomain(domain)
 					if err != nil {
 						log.Println("Error processing domain:", err)
-						continue
 					}
 					outChan <- domainNS
 				default:
@@ -141,16 +145,10 @@ func compareNS(requiredNS mapset.Set, domainNS DomainNS) (errors int) {
 	fmt.Printf("----- %s -----\n", domainNS.Domain)
 	errors = 0
 
-	zoneVregistrar := domainNS.ZoneNS.Difference(domainNS.RegistrarNS)
-	if zoneVregistrar.Cardinality() > 0 {
-		fmt.Println("WARN: In zone, not in registrar:", zoneVregistrar)
+	if domainNS.Error != nil {
+		fmt.Println("CRIT:", domainNS.Error)
 		errors++
-	}
-
-	registrarVzone := domainNS.RegistrarNS.Difference(domainNS.ZoneNS)
-	if registrarVzone.Cardinality() > 0 {
-		fmt.Println("WARN: In registrar, not in zone:", registrarVzone)
-		errors++
+		return
 	}
 
 	requiredVregistrar := requiredNS.Difference(domainNS.RegistrarNS)
@@ -162,6 +160,18 @@ func compareNS(requiredNS mapset.Set, domainNS DomainNS) (errors int) {
 	registrarVrequired := domainNS.RegistrarNS.Difference(requiredNS)
 	if registrarVrequired.Cardinality() > 0 {
 		fmt.Printf("ERROR: In registrar, not required: %v\n", registrarVrequired)
+		errors++
+	}
+
+	zoneVregistrar := domainNS.ZoneNS.Difference(domainNS.RegistrarNS)
+	if zoneVregistrar.Cardinality() > 0 {
+		fmt.Println("WARN: In zone, not in registrar:", zoneVregistrar)
+		errors++
+	}
+
+	registrarVzone := domainNS.RegistrarNS.Difference(domainNS.ZoneNS)
+	if registrarVzone.Cardinality() > 0 {
+		fmt.Println("WARN: In registrar, not in zone:", registrarVzone)
 		errors++
 	}
 
@@ -180,6 +190,7 @@ func checkDomain(domain string) (domainNS DomainNS, err error) {
 
 	parent, parentNS, zoneNS, err := domainParent(domain)
 	if err != nil {
+		domainNS.Error = err
 		return
 	}
 	log.Printf("Domain: %s, Parent: %s, ParentNS: %s", domain, parent, parentNS)
