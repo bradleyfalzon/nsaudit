@@ -9,13 +9,23 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/deckarep/golang-set"
 	"github.com/miekg/dns"
 )
 
-var nsCache = make(map[string]string)
+var (
+	nsCache       = make(map[string]string)
+	channelBuffer = 4096
+)
+
+type DomainNS struct {
+	Domain string
+	RegistrarNS,
+	ZoneNS mapset.Set
+}
 
 func main() {
 
@@ -38,61 +48,135 @@ func main() {
 	}
 	defer domains.Close()
 
-	scanner := bufio.NewScanner(domains)
-	for scanner.Scan() {
-		domain := scanner.Text()
-		registrarNS, zoneNS, err := checkDomain(domain, flag.Args())
-		if err != nil {
-			log.Println("Error processing domain:", err)
-			continue
+	// Create our buffered channel
+	inChan := make(chan string, channelBuffer)
+	outChan := make(chan DomainNS, channelBuffer)
+
+	// Insert domains into buffered channel, we do this as a go func in case
+	// we're inserting more records than the channel has buffers. Once a buffer
+	// is full, we'd block until it starts draining - and we can't start
+	// draining if we block whilst filling it.
+	go func() {
+		scanner := bufio.NewScanner(domains)
+		for scanner.Scan() {
+			// write the domain to the channel for processing
+			inChan <- scanner.Text()
+		}
+		log.Println("Finished adding domains to channel")
+	}()
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < 4; i++ {
+		log.Println("Starting worker:", i)
+
+		wg.Add(1)
+		go func(wg *sync.WaitGroup) {
+
+			defer wg.Done()
+			for {
+				select {
+
+				case domain := <-inChan:
+					domainNS, err := checkDomain(domain)
+					if err != nil {
+						log.Println("Error processing domain:", err)
+						continue
+					}
+					outChan <- domainNS
+				default:
+					return
+				}
+			}
+		}(&wg)
+	}
+
+	log.Println("Waiting for workers to finish")
+	wg.Wait()
+
+	// Close the channel, so when the channel is empty (we've read it all) we
+	// don't block waiting for more data. Instead channel will return empty
+	// type, and we can detect this.
+	close(outChan)
+
+	totalDomains := 0
+	totalErrors := 0
+	domainsWithErrors := 0
+
+	log.Println("Results:")
+	done := false
+	for {
+		select {
+		case domainNS, ok := <-outChan:
+			if ok {
+				totalDomains++
+				errors := compareNS(requiredNS, domainNS)
+				if errors > 0 {
+					totalErrors += errors
+					domainsWithErrors++
+				}
+			} else {
+				// Empty struct, finishing
+				done = true
+			}
+		default:
+			break
 		}
 
-		compareNS(domain, requiredNS, registrarNS, zoneNS)
-
+		if done {
+			break
+		}
 	}
+
+	fmt.Printf("\nStats\n-----\n")
+	fmt.Printf("Domains: %d\n", totalDomains)
+	fmt.Printf("Domains with Errors/Warnings: %d (%d%%)\n", domainsWithErrors, domainsWithErrors/totalDomains*100)
+	fmt.Printf("Domains without Errors/Warnings: %d (%d%%)\n", totalDomains-domainsWithErrors, (totalDomains-domainsWithErrors)/totalDomains*100)
+	fmt.Printf("Total Errors: %d\n", totalErrors)
 
 }
 
-func compareNS(domain string, requiredNS, registrarNS, zoneNS mapset.Set) {
+func compareNS(requiredNS mapset.Set, domainNS DomainNS) (errors int) {
 
-	//log.Print(registrarNS)
-	//log.Print(zoneNS)
+	fmt.Printf("----- %s -----\n", domainNS.Domain)
+	errors = 0
 
-	log.Println("Processing domain:", domain)
-
-	zoneVregistrar := zoneNS.Difference(registrarNS)
+	zoneVregistrar := domainNS.ZoneNS.Difference(domainNS.RegistrarNS)
 	if zoneVregistrar.Cardinality() > 0 {
-		log.Println("WARNING the following entries are in the zone, but not in the registrar")
-		log.Println(zoneVregistrar)
+		fmt.Println("WARN: In zone, not in registrar:", zoneVregistrar)
+		errors++
 	}
 
-	registrarVzone := registrarNS.Difference(zoneNS)
+	registrarVzone := domainNS.RegistrarNS.Difference(domainNS.ZoneNS)
 	if registrarVzone.Cardinality() > 0 {
-		log.Println("WARNING, the following entries are in the registrar, but not in the zone")
-		log.Println(registrarVzone)
+		fmt.Println("WARN: In registrar, not in zone:", registrarVzone)
+		errors++
 	}
 
-	requiredVregistrar := requiredNS.Difference(registrarNS)
+	requiredVregistrar := requiredNS.Difference(domainNS.RegistrarNS)
 	if requiredVregistrar.Cardinality() > 0 {
-		log.Println("WARNING the following entries are required, but not in the registrar")
-		log.Println(requiredVregistrar)
+		fmt.Println("ERROR: Required, not in registrar:", requiredVregistrar)
+		errors++
 	}
 
-	registrarVrequired := registrarNS.Difference(requiredNS)
+	registrarVrequired := domainNS.RegistrarNS.Difference(requiredNS)
 	if registrarVrequired.Cardinality() > 0 {
-		log.Println("WARNING, the following entries are in the registrar, but not required")
-		log.Println(registrarVrequired)
+		fmt.Printf("ERROR: In registrar, not required: %v\n", registrarVrequired)
+		errors++
 	}
+
+	return
 
 }
 
-func checkDomain(domain string, requireNS []string) (registrarNSRR mapset.Set, zoneNSRR mapset.Set, err error) {
+func checkDomain(domain string) (domainNS DomainNS, err error) {
 
 	// I don't actually know if this is required, might make LookupNS faster as
 	// it knows it's rooted already
 	if domain[len(domain):] != "." {
 		domain = domain + "."
 	}
+	domainNS.Domain = domain
 
 	parent, parentNS, zoneNS, err := domainParent(domain)
 	if err != nil {
@@ -101,10 +185,16 @@ func checkDomain(domain string, requireNS []string) (registrarNSRR mapset.Set, z
 	log.Printf("Domain: %s, Parent: %s, ParentNS: %s", domain, parent, parentNS)
 
 	log.Println("Fetching registrar NS records...")
-	registrarNSRR, err = queryNS(domain, parentNS, true)
+	domainNS.RegistrarNS, err = queryNS(domain, parentNS, true)
+	if err != nil {
+		return
+	}
 
 	log.Println("Fetching zone NS records...")
-	zoneNSRR, err = queryNS(domain, zoneNS, false)
+	domainNS.ZoneNS, err = queryNS(domain, zoneNS, false)
+	if err != nil {
+		return
+	}
 
 	return
 }
