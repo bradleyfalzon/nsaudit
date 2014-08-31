@@ -25,7 +25,20 @@ type DomainNS struct {
 	Error  error
 	RegistrarNS,
 	ZoneNS mapset.Set
+	MSGs []msg
 }
+
+type msg struct {
+	pri int
+	msg string
+}
+
+const (
+	LOG_DIFF = iota
+	LOG_WARNING
+	LOG_ERR
+	LOG_CRIT
+)
 
 var argsFile = goopt.String([]string{"-f", "--file"}, "domains.csv", "Read domains from this file")
 var argsNS = goopt.Strings([]string{"-n", "--nameserver"}, "", "Name server to check for (use option multiple times)")
@@ -33,6 +46,7 @@ var argsCB = goopt.Int([]string{"-c", "--channel-buffer"}, 4096, "Size of the go
 var argsW = goopt.Int([]string{"-w", "--workers"}, 10, "Concurrent workers to start to fetch DNS records")
 var argsTO = goopt.Int([]string{"-t", "--timeout"}, 5, "DNS timeout in seconds")
 var argsRE = goopt.Int([]string{"-r", "--retry"}, 3, "DNS retry times before giving up")
+var argsZ = goopt.Flag([]string{"-z", "--zone-warnings"}, []string{}, "Show warnings when the registrar and zone entries don't match", "")
 
 func main() {
 
@@ -65,12 +79,15 @@ func main() {
 	// is full, we'd block until it starts draining - and we can't start
 	// draining if we block whilst filling it.
 	go func() {
+		log.Println("Adding domains to channel")
 		scanner := bufio.NewScanner(domains)
+		c := 0
 		for scanner.Scan() {
+			c++
 			// write the domain to the channel for processing
 			inChan <- scanner.Text()
 		}
-		log.Println("Finished adding domains to channel")
+		log.Printf("Finished adding %d domains to channel\n", c)
 	}()
 
 	var wg sync.WaitGroup
@@ -117,7 +134,7 @@ func main() {
 		case domainNS, ok := <-outChan:
 			if ok {
 				totalDomains++
-				errors := compareNS(requiredNS, domainNS)
+				errors := compareNS(requiredNS, &domainNS)
 				if errors > 0 {
 					totalErrors += errors
 					domainsWithErrors++
@@ -143,43 +160,54 @@ func main() {
 
 }
 
-func compareNS(requiredNS mapset.Set, domainNS DomainNS) (errors int) {
+func displayNSMsgs(domainNS *DomainNS) {
 
 	fmt.Printf("----- %s -----\n", domainNS.Domain)
+
+	if len(domainNS.MSGs) == 0 {
+		fmt.Print("OK")
+		return
+	}
+
+	for _, msg := range domainNS.MSGs {
+		switch msg.pri {
+		case LOG_CRIT:
+			fmt.Println("CRIT:", msg.msg)
+		case LOG_ERR:
+			fmt.Println("ERR:", msg.msg)
+		case LOG_WARNING:
+			if *argsZ {
+				fmt.Println("WARN:", msg.msg)
+			}
+		default:
+			fmt.Println("UNKN:", msg.msg)
+		}
+	}
+}
+
+func compareNS(requiredNS mapset.Set, domainNS *DomainNS) (errors int) {
+
+	defer displayNSMsgs(domainNS)
 	errors = 0
 
 	if domainNS.Error != nil {
-		fmt.Println("CRIT:", domainNS.Error)
+		domainNS.MSGs = append(domainNS.MSGs, msg{pri: LOG_CRIT, msg: fmt.Sprintf("%s", domainNS.Error)})
 		errors++
 		return
 	}
 
 	requiredVregistrar := requiredNS.Difference(domainNS.RegistrarNS)
-	if requiredVregistrar.Cardinality() > 0 {
-		fmt.Println("ERROR: Required, not in registrar:", requiredVregistrar)
-		errors++
-	}
-
 	registrarVrequired := domainNS.RegistrarNS.Difference(requiredNS)
-	if registrarVrequired.Cardinality() > 0 {
-		fmt.Println("ERROR: In registrar, not required:", registrarVrequired)
+	if requiredVregistrar.Cardinality() > 0 || registrarVrequired.Cardinality() > 0 {
+		domainNS.MSGs = append(domainNS.MSGs, msg{pri: LOG_ERR, msg: fmt.Sprintf("Regitrar and required mismatch, registrar NS records: %v", domainNS.RegistrarNS)})
 		errors++
 	}
 
 	zoneVregistrar := domainNS.ZoneNS.Difference(domainNS.RegistrarNS)
-	if zoneVregistrar.Cardinality() > 0 {
-		fmt.Println("WARN: In zone, not in registrar:", zoneVregistrar)
-		errors++
-	}
-
 	registrarVzone := domainNS.RegistrarNS.Difference(domainNS.ZoneNS)
-	if registrarVzone.Cardinality() > 0 {
-		fmt.Println("WARN: In registrar, not in zone:", registrarVzone)
+	if zoneVregistrar.Cardinality() > 0 || registrarVzone.Cardinality() > 0 {
+		domainNS.MSGs = append(domainNS.MSGs, msg{pri: LOG_WARNING, msg: fmt.Sprintf("Zone and registrar mismatch: Zone Extra: %v, Registrar Extra: %v", zoneVregistrar, registrarVzone)})
 		errors++
-	}
-
-	if errors == 0 {
-		fmt.Println("OK")
 	}
 
 	return
